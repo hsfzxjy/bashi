@@ -1,0 +1,150 @@
+#!/bin/bash
+
+# Copyright (C) 2021 Jingyi Xie (hsfzxjy) <hsfzxjy@gmail.com>
+# All rights reserved.
+
+# A script to run a bunch of jobs in system idle time. When some other
+# users logged onto the system, the script automatically shutdown running
+# jobs, and resume them until all other users are inactive in again.
+
+# Jobs can be scheduled concurrently to maximize resource utilization.
+
+function just_logined() {
+    IDLE_TIMES=$(who -s | awk '{ print $2 }' | (cd /dev && xargs stat -c '%n %U %X') | awk '{ print $1"\t"$2"\t"'"$(date +%s)"'-$3 }' | awk '{ if ($2 != "'$(whoami)'") print $3 }')
+    for TIME in ${IDLE_TIMES} 10000; do
+        if [ "${TIME}" -lt "${TIME_LIMIT}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+function process_exists() {
+    PID=$1
+    sudo kill -0 -- ${PID}
+    return $?
+}
+
+function is_number() {
+    [[ "$1" =~ '^[0-9]+$' ]]
+    return $?
+}
+
+function cleanup() {
+    for PID in "${PIDS[@]}"; do
+        if [ "${PID}" == "D" ] || [ "${PID}" == "Q" ]; then
+            sudo kill -KILL ${PID}
+            wait ${PID}
+            echo "[${PID}] killed"
+        fi
+    done
+    exit
+}
+trap cleanup SIGINT
+trap cleanup SIGTERM
+
+function usage() {
+    echo "Usage: $0 [-j CONCURRENCY=4] [-t TIME=120] <file|->" 1>&2
+    exit 1
+}
+
+function noop() {
+    echo NOOP >/dev/null
+}
+
+SENTINEL="@@@@END_OF_LIST_SENTINEL@@@@"
+
+CONCURRENCY=4
+TIME_LIMIT=120
+while getopts "j:t:" o; do
+    case $o in
+    j) CONCURRENCY=${OPTARG} ;;
+    t) TIME_LIMIT=${OPTARG} ;;
+    *) usage ;;
+    esac
+done
+FILE=${@:$OPTIND:1}
+if [ "${FILE}"x == "-x" ]; then
+    readarray -t COMMANDS
+elif [ -f "${FILE}" ]; then
+    readarray -t COMMANDS < <(bash "$1")
+else
+    usage
+fi
+
+COMMANDS+=("${SENTINEL}")
+echo "[[Command List]]"
+for CMD in "${COMMANDS[@]}"; do
+    echo ${CMD}
+done
+
+QUEUE=()
+PIDS=()
+IC=0
+while true; do
+    sleep 0.1s
+
+    if just_logined; then
+        if [ "${#PIDS[@]}" != "0" ]; then
+            echo "Someone else has just logined. Kill all processes."
+            for PID in "${PIDS[@]}"; do
+                if [ "${PID}" == "D" ] || [ "${PID}" == "Q" ]; then
+                    continue
+                fi
+                echo "Killing ${PID}..."
+                sudo kill -KILL ${PID}
+                wait "${PID}"
+            done
+            PIDS=()
+        fi
+        continue
+    fi
+
+    while [ "${#QUEUE[@]}" -lt "${CONCURRENCY}" ] && [ "${COMMANDS[$IC]}" != "${SENTINEL}" ]; do
+        QUEUE+=("${COMMANDS[$IC]}")
+        ((IC++))
+    done
+
+    while [ "${#PIDS[@]}" -lt "${#QUEUE[@]}" ]; do
+        PIDS+=("Q")
+    done
+
+    for ((I = 0; I < ${#PIDS[@]}; I++)); do
+        if [ ${PIDS[$I]} == "D" ] || [ ${PIDS[$I]} == "Q" ]; then
+            continue
+        fi
+        if process_exists ${PIDS[$I]}; then
+            noop
+        else
+            echo "[${PIDS[$I]}] FINISH "${QUEUE[$I]/@IDX/$I}""
+            if [ "${COMMANDS[$IC]}" != "${SENTINEL}" ]; then
+                PIDS[$I]="Q"
+                QUEUE[$I]="${COMMANDS[$IC]}"
+                ((IC++))
+            else
+                PIDS[$I]="D"
+                QUEUE[$I]=""
+            fi
+        fi
+    done
+
+    for ((I = 0; I < ${#PIDS[@]}; I++)); do
+        if [ "${PIDS[$I]}" == "Q" ]; then
+            CMD="${QUEUE[$I]/@IDX/$I}"
+            bash -c "${CMD}" &
+            PIDS[$I]="$!"
+            echo "[${PIDS[$I]}] START  ${CMD}"
+        fi
+    done
+
+    ALL_FINISHED=true
+    for PID in "${PIDS[@]}"; do
+        if [ "${PID}" != "D" ]; then
+            ALL_FINISHED=false
+        fi
+    done
+    if ${ALL_FINISHED}; then
+        echo All done!
+        break
+    fi
+done
